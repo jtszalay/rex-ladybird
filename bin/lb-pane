@@ -1,0 +1,19 @@
+#!/bin/bash
+# lb-pane [URL]: runs Ladybird in this Rex pane. Ladybird draws the page with
+# kitty graphics. Its DevTools server listens on a local port, which this
+# script records in ~/.lb/panes so that lb can drive the pane.
+set -u
+id="${REX_BLOCK:?lb-pane must run inside a Rex pane}"
+bin="${LB_LADYBIRD:-/Applications/Ladybird.app/Contents/MacOS/Ladybird}"
+dir="$HOME/.lb/panes"
+mkdir -p "$dir"
+
+port=6100
+while nc -z 127.0.0.1 "$port" 2>/dev/null || cat "$dir"/* 2>/dev/null | grep -qx "$port"; do
+  port=$((port + 1))
+done
+file="$dir/$id"
+echo "$port" >"$file"
+trap 'rm -f "$file"' EXIT
+
+"$bin" --headless=terminal --profile "${LB_PROFILE:-rex}" --devtools="$port" ${1:+"$1"}

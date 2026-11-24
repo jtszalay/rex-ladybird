@@ -1,0 +1,602 @@
+#!/usr/bin/python3 -I
+"""lb: drive Ladybird browser panes in Rex.
+
+Each pane runs lb-pane, which starts Ladybird with its DevTools server on a
+local port and records the port in ~/.lb/panes/<block>. lb reads pages over
+the DevTools protocol, and types with rex send so that keys are real.
+"""
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+PANES = os.path.expanduser("~/.lb/panes")
+HERE = os.path.dirname(os.path.realpath(__file__))
+PANE_CMD = os.path.join(HERE, "lb-pane")
+STATEMENT_START = re.compile(r"\s*(const|let|var|if|for|while|do|try|throw|switch|function|class|return)\b")
+
+
+class Fail(Exception):
+    pass
+
+
+def is_statements(src):
+    """Whether src is statements rather than one expression: it starts with a
+    statement keyword, or has a return or ; outside any brackets."""
+    if STATEMENT_START.match(src):
+        return True
+    depth, i, n = 0, 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "'\"`":
+            i += 1
+            while i < n and src[i] != c:
+                i += 2 if src[i] == "\\" else 1
+        elif src.startswith("//", i):
+            i = src.find("\n", i) % (n + 1)
+        elif src.startswith("/*", i):
+            i = (src.find("*/", i) + 2) or n
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and (c == ";" and src[i + 1:].strip() or
+                             re.match(r"\breturn\b", src[i:]) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_$"))):
+            return True
+        i += 1
+    return False
+
+
+# ------------------------------------------------------------------ devtools
+
+
+class DevTools:
+    """A connection to one pane's Firefox DevTools server. The server takes
+    one client at a time, so close a connection before opening another."""
+
+    def __init__(self, port):
+        try:
+            self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        except OSError:
+            raise Fail("the pane's browser does not answer; it may have quit")
+        self.buf = b""
+        self.recv()  # greeting from root
+        self.tab = self.request("root", {"type": "listTabs"})["tabs"][0]["actor"]
+        watcher = self.request(self.tab, {"type": "getWatcher"})["actor"]
+        self.send(watcher, {"type": "watchTargets", "targetType": "frame"})
+        while True:
+            m = self.recv()
+            if m.get("type") == "target-available-form":
+                self.console = m["target"]["consoleActor"]
+                break
+
+    def close(self):
+        self.sock.close()
+
+    def send(self, to, msg):
+        b = json.dumps(dict(msg, to=to)).encode()
+        self.sock.sendall(str(len(b)).encode() + b":" + b)
+
+    def recv(self):
+        while True:
+            if b":" in self.buf:
+                n, rest = self.buf.split(b":", 1)
+                n = int(n)
+                if len(rest) >= n:
+                    self.buf = rest[n:]
+                    return json.loads(rest[:n])
+            d = self.sock.recv(1 << 20)
+            if not d:
+                raise Fail("the pane's browser closed the connection")
+            self.buf += d
+
+    def request(self, to, msg):
+        self.send(to, msg)
+        while True:
+            m = self.recv()
+            if m.get("from") == to and "type" not in m:
+                if "error" in m:
+                    raise Fail(m.get("message", m["error"]))
+                return m
+
+    def raw(self, text):
+        """Evaluate text in the page and return the console's result packet."""
+        self.send(self.console, {"type": "evaluateJSAsync", "text": text})
+        while True:
+            try:
+                m = self.recv()
+            except socket.timeout:
+                raise Fail("the page did not answer; check the JavaScript for a syntax error")
+            if m.get("from") == self.console and m.get("type") == "evaluationResult":
+                return m
+
+    def eval(self, src, timeout=30):
+        """Evaluate src, await it, and return its value as JSON-decoded data.
+
+        src is an expression, or a function body when it uses return or
+        starts with a statement. Ladybird's console never answers a script
+        with a syntax error, so lb can't try one form and fall back.
+        """
+        key = "__lb_%d_%d" % (os.getpid(), int(time.time() * 1000))
+        body = src if is_statements(src) else "return (\n%s\n);" % src
+        text = (
+            "(() => { const k = %s; window[k] = undefined;"
+            " (async () => { %s\n})().then("
+            " v => { window[k] = JSON.stringify({ok: v === undefined ? null : v}) ?? '{\"ok\":null}'; },"
+            " e => { window[k] = JSON.stringify({err: String(e && e.message || e)}); });"
+            " return k; })()" % (json.dumps(key), body)
+        )
+        m = self.raw(text)
+        if m.get("hasException"):
+            raise Fail(m.get("exceptionMessage") or "JavaScript error")
+        deadline = time.time() + timeout
+        while True:
+            m = self.raw("(() => { const v = window[%s]; if (v !== undefined) delete window[%s]; return v; })()"
+                         % (json.dumps(key), json.dumps(key)))
+            v = m.get("result")
+            if isinstance(v, str):
+                out = json.loads(v)
+                if "err" in out:
+                    raise Fail(out["err"])
+                return out["ok"]
+            if time.time() > deadline:
+                raise Fail("JavaScript did not finish within %ss" % timeout)
+            time.sleep(0.05)
+
+
+# --------------------------------------------------------------------- panes
+
+
+def rex(*args, capture=True):
+    r = subprocess.run(["rex", *args], capture_output=capture, text=True)
+    if r.returncode != 0:
+        raise Fail((r.stderr or r.stdout).strip() or "rex %s failed" % args[0])
+    return r.stdout
+
+
+def port_open(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def panes():
+    """Live panes as {block_id: port}. Removes records of panes that are gone."""
+    out = {}
+    if not os.path.isdir(PANES):
+        return out
+    for name in os.listdir(PANES):
+        path = os.path.join(PANES, name)
+        try:
+            port = int(open(path).read().strip())
+        except (OSError, ValueError):
+            continue
+        if port_open(port):
+            out[name] = port
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return out
+
+
+def info_of(port):
+    dt = DevTools(port)
+    try:
+        return dt.eval("({url: location.href, title: document.title, loading: document.readyState !== 'complete',"
+                       " old: !!window.__lb_mark})", 5)
+    finally:
+        dt.close()
+
+
+def resolve(target):
+    live = panes()
+    if not live:
+        raise Fail("no Ladybird panes are open; start one with: lb open URL")
+    if not target:
+        if len(live) == 1:
+            return next(iter(live.items()))
+        raise Fail("%d panes are open; pick one with -b (see lb ls)" % len(live))
+    if target in live:
+        return target, live[target]
+    hits = [b for b in live if b.endswith(target)]
+    if not hits:
+        for b, p in live.items():
+            try:
+                if target.lower() in (info_of(p)["title"] or "").lower():
+                    hits.append(b)
+            except Fail:
+                pass
+    if len(hits) == 1:
+        return hits[0], live[hits[0]]
+    if not hits:
+        raise Fail("no pane matches %r (see lb ls)" % target)
+    raise Fail("%r matches %d panes; use the full ID" % (target, len(hits)))
+
+
+def normalize(url):
+    if "://" in url or url.startswith(("about:", "data:", "file:")):
+        return url
+    host = url.split("/")[0].split(":")[0]
+    if host in ("localhost", "127.0.0.1", "0.0.0.0") or host.endswith(".localhost"):
+        return "http://" + url
+    return "https://" + url
+
+
+def mark(dt):
+    """Flag the current document, so a wait can tell when a new one replaces it."""
+    dt.eval("(window.__lb_mark = true)", 5)
+
+
+def wait_load(port, timeout, new_page=True):
+    """Wait until the page has loaded. With new_page, wait for a document
+    other than the one mark() flagged."""
+    deadline = time.time() + timeout
+    time.sleep(0.15)
+    while True:
+        try:
+            i = info_of(port)
+        except Fail as e:
+            i = None  # The page is between documents.
+            if os.environ.get("LB_DEBUG"):
+                print("wait_load: %s" % e, file=sys.stderr)
+        if i and not i["loading"] and not (new_page and i["old"]):
+            if i["url"] == "about:error":
+                raise Fail(i["title"] or "the page failed to load")
+            return {k: i[k] for k in ("url", "title", "loading")}
+        if time.time() > deadline:
+            raise Fail("the page did not load within %ss" % timeout)
+        time.sleep(0.2)
+
+
+def settle(port, timeout):
+    """After an action on a marked page, wait for any navigation it started."""
+    time.sleep(0.3)
+    try:
+        i = info_of(port)
+        if i["old"] and not i["loading"]:
+            return
+    except Fail:
+        pass
+    wait_load(port, timeout)
+
+
+def wait_registered(block, timeout=10):
+    path = os.path.join(PANES, block)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            port = int(open(path).read().strip())
+            if port_open(port):
+                return port
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    raise Fail("the pane's browser did not start")
+
+
+# ------------------------------------------------------------------ snapshot
+
+SNAPSHOT_JS = r"""
+(() => {
+  for (const el of document.querySelectorAll('[data-lb-ref]')) el.removeAttribute('data-lb-ref');
+  const sel = 'a[href], button, input:not([type=hidden]), select, textarea, summary, [contenteditable=""], [contenteditable=true],'
+    + ' [role=button], [role=link], [role=checkbox], [role=radio], [role=tab], [role=menuitem], [role=option],'
+    + ' [role=switch], [role=textbox], [role=combobox], [role=searchbox], [tabindex]:not([tabindex="-1"])';
+  const kindOf = el => {
+    const role = el.getAttribute('role');
+    if (role) return role;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'a') return 'link';
+    if (tag === 'input') {
+      const t = (el.getAttribute('type') || 'text').toLowerCase();
+      if (['checkbox', 'radio'].includes(t)) return t;
+      if (['submit', 'button', 'reset', 'image'].includes(t)) return 'button';
+      return t === 'text' ? 'text' : t;
+    }
+    if (tag === 'textarea' || el.isContentEditable) return 'text';
+    return tag;
+  };
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  const labelOf = el => {
+    const by = el.getAttribute('aria-labelledby');
+    return clean(el.getAttribute('aria-label'))
+      || clean(by && by.split(/\s+/).map(id => document.getElementById(id)?.textContent).join(' '))
+      || clean(el.labels && [...el.labels].map(l => l.textContent).join(' '))
+      || clean(el.getAttribute('placeholder'))
+      || clean(el.innerText)
+      || clean(el.getAttribute('title'))
+      || clean(el.getAttribute('alt'))
+      || clean(['submit', 'button', 'reset'].includes(el.type) ? el.value : '')
+      || clean(el.getAttribute('name'));
+  };
+  const lines = [];
+  let n = 0;
+  for (const el of document.querySelectorAll(sel)) {
+    if (!el.getClientRects().length) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none') continue;
+    const ref = 'e' + (++n);
+    el.setAttribute('data-lb-ref', ref);
+    const flags = [];
+    if (el.checked || el.getAttribute('aria-checked') === 'true') flags.push('checked');
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') flags.push('disabled');
+    if (el === document.activeElement) flags.push('focused');
+    const v = ('value' in el && !['checkbox', 'radio', 'submit', 'button'].includes(el.type) && el.value)
+      ? ' = ' + JSON.stringify(String(el.value).slice(0, 80)) : '';
+    lines.push(`[${ref}] ${kindOf(el)} ${JSON.stringify(labelOf(el))}${v}${flags.length ? ' [' + flags.join('] [') + ']' : ''}`);
+  }
+  return {title: document.title, url: location.href, elements: lines,
+          text: (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').trim()};
+})()
+"""
+
+FIND_JS = r"""
+const t = %s;
+const el = /^e\d+$/.test(t) ? document.querySelector(`[data-lb-ref="${t}"]`) : document.querySelector(t);
+if (!el) throw new Error(/^e\d+$/.test(t) ? `no element ${t}; run lb snapshot again` : `nothing matches ${t}`);
+el.scrollIntoView({block: 'center', inline: 'center'});
+"""
+
+CLICK_JS = FIND_JS + r"""
+const r = el.getBoundingClientRect();
+const o = {bubbles: true, cancelable: true, composed: true, view: window, button: 0,
+           clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
+el.dispatchEvent(new PointerEvent('pointerdown', o));
+el.dispatchEvent(new MouseEvent('mousedown', o));
+if (el.focus) el.focus();
+el.dispatchEvent(new PointerEvent('pointerup', o));
+el.dispatchEvent(new MouseEvent('mouseup', o));
+el.click();
+return true;
+"""
+
+FOCUS_JS = FIND_JS + r"""
+el.focus();
+if (%s) {
+  if ('value' in el) {
+    const proto = Object.getPrototypeOf(el);
+    const set = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    set ? set.call(el, '') : (el.value = '');
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+  } else if (el.isContentEditable) {
+    el.textContent = '';
+  }
+}
+return document.activeElement === el || el.contains(document.activeElement);
+"""
+
+# -------------------------------------------------------------------- commands
+
+
+def emit(args, data, text):
+    if getattr(args, "json", False):
+        print(json.dumps(data))
+    elif text is not None:
+        print(text)
+
+
+def cmd_open(args):
+    url = normalize(args.url) if args.url else ""
+    session = args.session or os.environ.get("REX_SESSION")
+    pane = [PANE_CMD] + ([url] if url else [])
+    if args.tab:
+        out = rex("run", *(["-s", session] if session else []), "--label", "ladybird",
+                  "--focus=%s" % args.focus, "--json", "--", *pane)
+    else:
+        anchor = args.anchor or os.environ.get("REX_BLOCK")
+        out = rex("split", *(["-s", session] if session else []), *(["-b", anchor] if anchor else []),
+                  "--split=%s" % args.split, "--focus=%s" % args.focus, "--json", "--", *pane)
+    block = json.loads(out)["block_ids"][0]
+    print(block, flush=True)
+    if args.no_wait:
+        return
+    port = wait_registered(block)
+    if url:
+        wait_load(port, args.timeout, new_page=False)
+
+
+def cmd_ls(args):
+    rows = []
+    for b, p in sorted(panes().items()):
+        try:
+            i = info_of(p)
+        except Fail:
+            i = {"url": "", "title": "", "loading": True}
+        rows.append(dict(id=b, port=p, **i))
+    if args.json:
+        print(json.dumps(rows))
+    for r in [] if args.json else rows:
+        print("%s  %s  %s" % (r["id"], r["url"], r["title"]))
+
+
+def cmd_close(args):
+    b, _ = resolve(args.block)
+    rex("block", "close", b)
+
+
+def cmd_focus(args):
+    b, _ = resolve(args.block)
+    rex("focus", b)
+
+
+def cmd_nav(args):
+    _, p = resolve(args.block)
+    go(p, {"type": "navigateTo", "url": normalize(args.url)}, args)
+
+
+def go(port, packet, args):
+    """Navigate with a tab actor request, which also works from error pages,
+    and wait for the new page."""
+    dt = DevTools(port)
+    mark(dt)
+    dt.request(dt.tab, packet)
+    dt.close()
+    emit(args, wait_load(port, args.timeout), None)
+
+
+def history_cmd(packet_type):
+    def run(args):
+        _, p = resolve(args.block)
+        go(p, {"type": packet_type}, args)
+    return run
+
+
+def cmd_info(args):
+    b, p = resolve(args.block)
+    i = info_of(p)
+    i = dict(id=b, port=p, url=i["url"], title=i["title"], loading=i["loading"])
+    emit(args, i, "%s\n%s%s" % (i["title"], i["url"], "\n(loading)" if i["loading"] else ""))
+
+
+def cmd_snapshot(args):
+    _, p = resolve(args.block)
+    s = DevTools(p).eval(SNAPSHOT_JS, 15)
+    text = s["text"]
+    if args.max and len(text) > args.max:
+        text = text[:args.max] + "\n…(%d more characters; use --max 0 for all)" % (len(s["text"]) - args.max)
+    if args.json:
+        print(json.dumps(s))
+        return
+    print("%s\n%s\n\nElements:\n%s\n\nText:\n%s" % (
+        s["title"], s["url"], "\n".join(s["elements"]) or "(none)", text))
+
+
+def cmd_click(args):
+    _, p = resolve(args.block)
+    dt = DevTools(p)
+    mark(dt)
+    dt.eval(CLICK_JS % json.dumps(args.target), 10)
+    dt.close()
+    settle(p, args.timeout)
+
+
+def cmd_type(args):
+    b, p = resolve(args.block)
+    dt = DevTools(p)
+    mark(dt)
+    if not dt.eval(FOCUS_JS % (json.dumps(args.target), "true" if args.clear else "false"), 10):
+        raise Fail("%s did not take focus" % args.target)
+    dt.close()
+    if args.text:
+        rex("send", "-b", b, args.text)
+    if args.submit:
+        rex("send-key", "-b", b, "enter")
+        settle(p, args.timeout)
+
+
+def cmd_press(args):
+    b, p = resolve(args.block)
+    dt = DevTools(p)
+    mark(dt)
+    dt.close()
+    rex("send-key", "-b", b, *args.keys)
+    settle(p, args.timeout)
+
+
+def cmd_eval(args):
+    _, p = resolve(args.block)
+    src = sys.stdin.read() if args.js == "-" else args.js
+    print(json.dumps(DevTools(p).eval(src, args.timeout)))
+
+
+def cmd_wait(args):
+    _, p = resolve(args.block)
+    deadline = time.time() + args.timeout
+    checks = ["document.readyState === 'complete'"]
+    if args.selector:
+        checks.append("!!document.querySelector(%s)" % json.dumps(args.selector))
+    if args.text:
+        checks.append("(document.body?.innerText || '').includes(%s)" % json.dumps(args.text))
+    js = " && ".join(checks)
+    while True:
+        dt = None
+        try:
+            dt = DevTools(p)
+            while not dt.eval(js, 5):  # Reuse dt until the page changes under it.
+                if time.time() > deadline:
+                    raise Fail("timed out after %ss" % args.timeout)
+                time.sleep(0.2)
+            return
+        except (OSError, Fail) as e:
+            if isinstance(e, Fail) and str(e).startswith("timed out"):
+                raise
+            if time.time() > deadline:
+                raise Fail("timed out after %ss" % args.timeout)
+            time.sleep(0.2)
+        finally:
+            if dt:
+                dt.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="lb", description="Drive Ladybird browser panes in Rex.")
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", required=True)
+
+    def add(name, fn, help, block=True, json_flag=False, timeout=30, aliases=()):
+        p = sub.add_parser(name, help=help, description=help, aliases=list(aliases))
+        if block:
+            p.add_argument("-b", "--block", help="pane: block ID, ID suffix, or part of the page title")
+        if json_flag:
+            p.add_argument("--json", action="store_true", help="print JSON")
+        if timeout:
+            p.add_argument("--timeout", type=float, default=timeout, help="seconds to wait (default %s)" % timeout)
+        p.set_defaults(fn=fn)
+        return p
+
+    p = add("open", cmd_open, "Open a Ladybird pane and print its block ID", block=False)
+    p.add_argument("url", nargs="?")
+    p.add_argument("--tab", action="store_true", help="open in a new tab instead of a split")
+    p.add_argument("--split", default="right", choices=["right", "left", "above", "below"])
+    p.add_argument("--focus", default="true", choices=["true", "false"])
+    p.add_argument("-s", "--session", help="Rex session (default $REX_SESSION)")
+    p.add_argument("--anchor", help="pane to split beside (default $REX_BLOCK)")
+    p.add_argument("--no-wait", action="store_true", help="don't wait for the page to load")
+
+    add("ls", cmd_ls, "List Ladybird panes", block=False, json_flag=True, timeout=0, aliases=["list"])
+    add("close", cmd_close, "Close a pane", timeout=0)
+    add("focus", cmd_focus, "Give a pane the keyboard", timeout=0)
+    p = add("nav", cmd_nav, "Go to a URL and wait for it to load", json_flag=True)
+    p.add_argument("url")
+    add("back", history_cmd("goBack"), "Go back", json_flag=True)
+    add("forward", history_cmd("goForward"), "Go forward", json_flag=True)
+    add("reload", history_cmd("reloadDescriptor"), "Reload the page", json_flag=True)
+    add("info", cmd_info, "Print the page's URL, title, and load state", json_flag=True, timeout=0)
+    p = add("snapshot", cmd_snapshot, "Number the controls on the page (e1, e2, ...) and print its text",
+            json_flag=True, timeout=0)
+    p.add_argument("--max", type=int, default=20000, help="cap the page text at this many characters (0: no cap)")
+    p = add("click", cmd_click, "Click an element: a ref such as e2, or a CSS selector")
+    p.add_argument("target")
+    p = add("type", cmd_type, "Focus an element and type text into it with real key presses")
+    p.add_argument("target")
+    p.add_argument("text")
+    p.add_argument("--clear", action="store_true", help="empty the field first")
+    p.add_argument("--submit", action="store_true", help="press Enter afterwards")
+    p = add("press", cmd_press, "Press keys, such as enter, tab, escape, down, ctrl+a")
+    p.add_argument("keys", nargs="+")
+    p = add("eval", cmd_eval, "Run JavaScript (await allowed) and print the result as JSON; - reads stdin")
+    p.add_argument("js")
+    p = add("wait", cmd_wait, "Wait for the page to load, and for --selector or --text if given")
+    p.add_argument("--selector")
+    p.add_argument("--text")
+
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except Fail as e:
+        print("Error: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
