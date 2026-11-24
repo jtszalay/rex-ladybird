@@ -60,3 +60,7 @@ How each command works:
   gives up after 10 seconds and says to check the syntax.
 - The DevTools port listens on 127.0.0.1 without a token. Any local process
   can drive a pane, including its signed-in sessions.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
