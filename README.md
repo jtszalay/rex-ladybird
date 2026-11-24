@@ -7,13 +7,34 @@ Ladybird can draw pages straight into a terminal with the kitty graphics
 protocol (`--headless=terminal`). Rex supports that protocol, so a browser pane
 is an ordinary Rex pane. There's no overlay window.
 
+## Install
+
+You need macOS, [Ladybird](https://ladybird.org) in `/Applications` or
+`~/Applications`, [Rex](https://www.superlogical.com/rex/docs/installation)
+with a working `rex` command, and the Xcode command line tools (for
+`/usr/bin/python3`).
+
+```sh
+git clone https://github.com/jtszalay/rex-ladybird
+cd rex-ladybird && ./install.sh
+```
+
+The script asks no questions and is safe to run again. It links `lb` and
+`lb-pane` into `~/.local/bin` (set `PREFIX` to change that), installs the Rex
+module in `~/.config/rex/ladybird`, and adds `require("ladybird").setup{}` to
+Rex's `init.lua`. It checks the file with `rex config check` and restores the
+backup if the check fails. Update with `git pull && ./install.sh`.
+
+If you also use [rexweb](https://github.com/acoyfellow/rexweb), both take
+`Shift-Cmd-B`. Remove one, or pass `key = false` to it.
+
 ## Pieces
 
 | File | |
 | --- | --- |
 | `bin/lb-pane` | Runs Ladybird in the current pane. It turns on Ladybird's DevTools server on a free local port (6100 and up) and records the port in `~/.lb/panes/<block>`. |
-| `bin/lb` | The scripting CLI. Linked to `~/.local/bin/lb`. |
-| `lua/init.lua` | The Rex module. `~/.config/rex/ladybird` links here, and `init.lua` loads it with `require("ladybird").setup{}`. |
+| `bin/lb` | The scripting CLI. |
+| `lua/init.lua` | The Rex module. `install.sh` copies it to `~/.config/rex/ladybird`, and `init.lua` loads it with `require("ladybird").setup{}`. |
 
 The module adds **Open Browser Pane** (`Shift-Cmd-B`) and **Open Browser Tab**.
 Options: `key`, `split`, `ratio`, `home`, `profile` (default `rex`). All panes

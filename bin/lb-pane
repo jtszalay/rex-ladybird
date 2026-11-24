@@ -4,7 +4,17 @@
 # script records in ~/.lb/panes so that lb can drive the pane.
 set -u
 id="${REX_BLOCK:?lb-pane must run inside a Rex pane}"
-bin="${LB_LADYBIRD:-/Applications/Ladybird.app/Contents/MacOS/Ladybird}"
+bin="${LB_LADYBIRD:-}"
+if [ -z "$bin" ]; then
+  for app in /Applications/Ladybird.app "$HOME/Applications/Ladybird.app"; do
+    [ -x "$app/Contents/MacOS/Ladybird" ] && { bin="$app/Contents/MacOS/Ladybird"; break; }
+  done
+fi
+if [ -z "$bin" ]; then
+  printf '  Ladybird.app is not installed. Get it from https://ladybird.org\n'
+  sleep 3600
+  exit 1
+fi
 dir="$HOME/.lb/panes"
 mkdir -p "$dir"
 

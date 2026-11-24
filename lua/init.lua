@@ -15,7 +15,9 @@
 local M = {}
 
 local SHELL = "com.superlogical.terminal.shell"
-local PANE = os.getenv("HOME") .. "/src/rex-ladybird/bin/lb-pane"
+-- install.sh fills in the path of lb-pane.
+local PANE = "@PANE@"
+if PANE:sub(1, 1) == "@" then PANE = os.getenv("HOME") .. "/.local/bin/lb-pane" end
 
 local defaults = {
   key = "shift+cmd+b",
