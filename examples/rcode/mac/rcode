@@ -1,0 +1,41 @@
+#!/bin/bash
+# rcode DIR: opens DIR from the devbox in VS Code (code-server), in a Ladybird
+# tab of a Rex session. The devbox unit code-server-mac-forward shares
+# code-server here as localhost:$RCODE_PORT and creates that session.
+#
+# Settings come from ~/.config/rcode/env, if it exists:
+#   RCODE_DIR      folder to open when DIR is not given
+#   RCODE_PORT     local port of the forward (default 18443)
+#   RCODE_SESSION  Rex session for the tab (default vscode)
+# ~/.config/rcode/password holds code-server's password (mode 600).
+set -euo pipefail
+PATH="$HOME/.local/bin:/usr/bin:/bin:$PATH"
+cfg="$HOME/.config/rcode"
+[ -f "$cfg/env" ] && . "$cfg/env"
+port="${RCODE_PORT:-18443}"
+session="${RCODE_SESSION:-vscode}"
+pwfile="$cfg/password"
+dir="${1:-${RCODE_DIR:-}}"
+[ -n "$dir" ] || { echo "usage: rcode DIR (or set RCODE_DIR in $cfg/env)" >&2; exit 2; }
+
+if ! curl -fsS -m 3 "http://localhost:$port/healthz" >/dev/null; then
+  echo "rcode: localhost:$port does not answer. Check the code-server-mac-forward unit on the devbox." >&2
+  exit 1
+fi
+
+sid=$(rex session ls --json | jq -r --arg s "$session" '.sessions[] | select(.label == $s) | .session_id' | head -1)
+[ -n "$sid" ] || { echo "rcode: no Rex session named $session. The forward unit on the devbox makes it." >&2; exit 1; }
+
+url="http://localhost:$port/?folder=$(jq -rn --arg d "$dir" '$d|@uri')"
+bid=$(lb open --tab -s "$sid" --focus=false --timeout 30 "$url")
+
+# code-server keeps its login cookie in Ladybird's profile, so the password form shows only on the first visit.
+if [ -f "$pwfile" ] &&
+  lb wait -b "$bid" --selector 'input[type=password], .monaco-workbench' --timeout 20 2>/dev/null &&
+  [ "$(lb eval -b "$bid" '!!document.querySelector("input[type=password]")')" = true ]; then
+  lb type -b "$bid" --submit 'input[type=password]' "$(<"$pwfile")"
+fi
+
+# The app shows one session at a time. session.select brings this one in front.
+app=$(rex client ls --json | jq -r '.clients[] | select(.info.kind == "app" and .connection_state == "connected") | .client_id' | head -1)
+[ -z "$app" ] || rex -C "$app" do session.select session_id="$sid" >/dev/null

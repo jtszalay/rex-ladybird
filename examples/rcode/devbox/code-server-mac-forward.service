@@ -1,0 +1,13 @@
+[Unit]
+Description=Forward the Mac's localhost:@PORT@ to code-server through the Mac Rex server
+After=code-server.service
+
+[Service]
+# The Mac socket exists only while the SSH session that forwards it is up, so retry until it appears.
+ExecStartPre=/bin/sh -c '@REX@ -S @HOST@ session ls | grep -q "^@SESSION@ " || @REX@ -S @HOST@ session new @SESSION@'
+ExecStart=@REX@ -S @HOST@ forward share -s @SESSION@ --port @PORT@ 8443
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

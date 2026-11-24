@@ -1,0 +1,9 @@
+# ~/.config/code-server/config.yaml
+bind-addr: 127.0.0.1:8443
+auth: password
+password: CHANGE-ME   # the same password goes in the Mac's ~/.config/rcode/password
+cert: false
+disable-telemetry: true
+disable-update-check: true
+disable-workspace-trust: true
+app-name: devbox

@@ -70,6 +70,11 @@ How each command works:
 - Commands that may navigate wait for a new document to finish loading. A
   failed load exits 1 with Ladybird's error title.
 
+## Example
+
+[examples/rcode](examples/rcode) opens VS Code from a remote devbox in a
+Ladybird tab, and uses `lb` to sign in to it.
+
 ## Limits
 
 - `click` dispatches pointer and mouse events and calls `click()`. It does not

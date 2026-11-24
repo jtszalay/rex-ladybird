@@ -1,0 +1,10 @@
+[Unit]
+Description=code-server (VS Code in the browser) on 127.0.0.1:8443
+
+[Service]
+ExecStart=%h/.local/bin/code-server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

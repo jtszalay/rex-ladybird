@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# rcode [DIR]: opens DIR (default: the current directory) in VS Code in the Mac's Rex app.
+# It runs the Mac's ~/.local/bin/rcode through the Rex host "mac" (RCODE_MAC_HOST),
+# in the Rex session RCODE_SESSION (default vscode).
+set -euo pipefail
+dir=$(realpath "${1:-.}")
+host="${RCODE_MAC_HOST:-mac}"
+session="${RCODE_SESSION:-vscode}"
+rex -S "$host" run -s "$session" --label rcode --focus=false --wait --shell=none -- \
+  /bin/sh -c 'exec "$HOME/.local/bin/rcode" "$1"' rcode "$dir" >/dev/null ||
+  { echo "rcode: the Mac side failed. Run it there to see why: ~/.local/bin/rcode $dir" >&2; exit 1; }
